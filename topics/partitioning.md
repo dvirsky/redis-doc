@@ -1,7 +1,9 @@
+
 Partitioning: how to split data among multiple Redis instances.
 ===
 
 Partitioning is the process of splitting your data into multiple Redis instances, so that every instance will only contain a subset of your keys. The first part of this document will introduce you to the concept of partitioning, the second part will show you the alternatives for Redis partitioning.
+
 
 Why partitioning is useful
 ---
@@ -10,6 +12,7 @@ Partitioning in Redis serves two main goals:
 
 * It allows for much larger databases, using the sum of the memory of many computers. Without partitioning you are limited to the amount of memory a single computer can support.
 * It allows scaling the computational power to multiple cores and multiple computers, and the network bandwidth to multiple computers and network adapters.
+
 
 Partitioning basics
 ---
@@ -27,6 +30,7 @@ An alternative to range partitioning is **hash partitioning**. This scheme works
 
 There are many other ways to perform partitioning, but with these two examples you should get the idea. One advanced form of hash partitioning is called **consistent hashing** and is implemented by a few Redis clients and proxies.
 
+
 Different implementations of partitioning
 ---
 
@@ -35,6 +39,7 @@ Partitioning can be the responsibility of different parts of a software stack.
 * **Client side partitioning** means that the clients directly select the right node where to write or read a given key. Many Redis clients implement client side partitioning.
 * **Proxy assisted partitioning** means that our clients send requests to a proxy that is able to speak the Redis protocol, instead of sending requests directly to the right Redis instance. The proxy will make sure to forward our request to the right Redis instance accordingly to the configured partitioning schema, and will send the replies back to the client. The Redis and Memcached proxy [Twemproxy](https://github.com/twitter/twemproxy) implements proxy assisted partitioning.
 * **Query routing** means that you can send your query to a random instance, and the instance will make sure to forward your query to the right node. Redis Cluster implements an hybrid form of query routing, with the help of the client (the request is not directly forwarded from a Redis instance to another, but the client gets *redirected* to the right node).
+
 
 Disadvantages of partitioning
 ---
@@ -47,6 +52,57 @@ Some features of Redis don't play very well with partitioning:
 * When partitioning is used, data handling is more complex, for instance you have to handle multiple RDB / AOF files, and to make a backup of your data you need to aggregate the persistence files from multiple instances and hosts.
 * Adding and removing capacity can be complex. For instance Redis Cluster supports mostly transparent rebalancing of data with the ability to add and remove nodes at runtime, but other systems like client side partitioning and proxies don't support this feature. However a technique called *Pre-sharding* helps in this regard.
 
+## Client-Side partitioning of Search Indexes
+
+One non-trivial use-case for partitioning is Indexing. There are various methods of creating indexes on redis data, from Full-Text indexes to numerical ones. However, indexes are a bit problematic when it comes to partitioning, especially Full-Text indexes. 
+
+Full-Text indexes are basically scored lists of documents per word, and are usually modeled with Sorted Sets, where each word has its own set. Searching for "hello world" requires intersecting the Sorted Sets at the keys for *hello* and *world*. 
+
+This works fine on a single Redis instance, but if you partition your index keys on multiple instances, you are facing a problem: what if the key for "hello" is not on the same partition as "world"?
+
+The solution to this is to partition the index using client-side logic,  and to use **document ids**, rather than per-word keys, as the partitioning key. Each partition will have a complete index of a subset of documents, and a query would require merging the result from all partitions. 
+
+The technique works as follows:
+
+
+
+#### Partitioning
+
+1. We select an arbitrary number of index partitions **K**. It should be greater than the number of instances, preferably at least double.
+
+2. We use the **document id** as as a partitioning hint:
+
+   * Let **K** be the number of partitions
+
+   * Let **H** be a hash function (e.g. crc32,  fnv32, etc)  yielding an integer
+
+   * P, the desired partition for a document, is calculated as:
+
+     ```
+     P = H(id) mod K
+     ```
+
+     ​
+
+#### Indexing
+
+When a document is indexed, we calculate the partition **P** for it. Then we can either select a connection to a node based on it, or use the Redis Cluster's sharding to route the requests to the desired node. The index key for the word "hello", given a **P** value 3, would be something like "index::hello::{3}". 
+
+This pattern means that we will distribute the index partitions evenly across the nodes, and that given a cluster-aware client, we can be oblivious to where in the cluster they end up, and which documents go in what partition. The only thing that matters is that the distribution is even.
+
+#### Retrieval
+
+When we have to search the index, we don't know which documents will be in what index partition.
+Thus we need to search all partitions at once:
+
+* We K run parallel workers correlating to K partitions.
+
+* We perform the same operation on all of them in parallel, be it on a single machine or multiple machines.
+
+* We aggregate the result into a single list based on their scores.
+
+  > **Important note**: This means that if we need to fetch results M results starting at result N (`N...(N+M)`, we will need to fetch results `0...M` from each partition, merge them into one list, and extract results `N...N+M` from the merged list. 
+
 Data store or cache?
 ---
 
@@ -58,6 +114,7 @@ The main concept here is the following:
 
 * If Redis is used as a cache **scaling up and down** using consistent hashing is easy.
 * If Redis is used as a store, **a fixed keys-to-nodes map is used, so the number of nodes must be fixed and cannot vary**. Otherwise, a system is needed that is able to rebalance keys between nodes when nodes are added or removed, and currently only Redis Cluster is able to do this - Redis Cluster is generally available and production-ready as of [April 1st, 2015](https://groups.google.com/d/msg/redis-db/dO0bFyD_THQ/Uoo2GjIx6qgJ).
+
 
 Presharding
 ---
@@ -82,10 +139,12 @@ Using Redis replication you will likely be able to do the move with minimal or n
 * Restart your clients with the new updated configuration.
 * Finally shut down the no longer used instances in the old server.
 
+
 Implementations of Redis partitioning
 ===
 
 So far we covered Redis partitioning in theory, but what about practice? What system should you use?
+
 
 Redis Cluster
 ---
@@ -97,6 +156,7 @@ You can get more information about Redis Cluster in the [Cluster tutorial](/topi
 Once Redis Cluster will be available, and if a Redis Cluster compliant client is available for your language, Redis Cluster will be the de facto standard for Redis partitioning.
 
 Redis Cluster is a mix between *query routing* and *client side partitioning*.
+
 
 Twemproxy
 ---
@@ -110,6 +170,7 @@ It is *not* a single point of failure since you can start multiple proxies and i
 Basically Twemproxy is an intermediate layer between clients and Redis instances, that will reliably handle partitioning for us with minimal additional complexities.
 
 You can read more about Twemproxy [in this antirez blog post](http://antirez.com/news/44).
+
 
 Clients supporting consistent hashing
 ---
